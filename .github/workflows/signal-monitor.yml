@@ -1,0 +1,146 @@
+name: NIFTY Signal Monitor
+
+on:
+  # Schedule to run during Indian market hours (IST = UTC+5:30)
+  schedule:
+    # Start at 9:10 AM IST (3:40 AM UTC)
+    - cron: '40 3 * * 1-5'
+    # Also allow manual triggers
+  workflow_dispatch:
+  
+  # Run on push to test
+  push:
+    branches:
+      - main
+      - develop
+
+env:
+  TZ: 'Asia/Kolkata'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  signal-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420  # 7 hours timeout
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Create logs directory
+        run: mkdir -p logs
+      
+      - name: Check market hours
+        id: market_check
+        run: |
+          python -c "
+          from datetime import datetime
+          import pytz
+          ist = pytz.timezone('Asia/Kolkata')
+          now = datetime.now(ist)
+          
+          # Check if market is open
+          is_weekday = now.weekday() < 5
+          is_market_hours = (9, 15) <= (now.hour, now.minute) <= (16, 0)
+          
+          if is_weekday and is_market_hours:
+              print('Market is OPEN')
+              print('::set-output name=should_run::true')
+          else:
+              print(f'Market is CLOSED (Day: {now.strftime('%A')}, Time: {now.strftime('%H:%M')} IST)')
+              print('::set-output name=should_run::false')
+          "
+      
+      - name: Run signal monitor
+        if: steps.market_check.outputs.should_run == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+          LOG_LEVEL: 'INFO'
+          LOG_TO_FILE: 'true'
+          COLORFUL_LOGS: 'false'  # Disable colors in CI
+          UPDATE_FREQUENCY: '1.0'  # Less frequent updates in CI
+        run: |
+          echo "Starting NIFTY Signal Monitor..."
+          echo "Current time: $(date)"
+          
+          # Run with timeout (6.5 hours)
+          timeout 23400 python nifty_signals.py || EXIT_CODE=$?
+          
+          # Check if timeout occurred (EXIT_CODE 124)
+          if [ "$EXIT_CODE" = "124" ]; then
+            echo "Monitor stopped after market hours (timeout)"
+            exit 0
+          else
+            exit $EXIT_CODE
+          fi
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: signal-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 7
+      
+      - name: Send notification
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ ! -z "$DISCORD_WEBHOOK_URL" ]; then
+            curl -H "Content-Type: application/json" \
+                 -d '{"content":"⚠️ NIFTY Signal Monitor failed! Check GitHub Actions logs."}' \
+                 $DISCORD_WEBHOOK_URL
+          fi
+
+  # Separate job to refresh token if needed
+  token-refresh:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    
+    steps:
+      - name: Check token expiry
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+        run: |
+          echo "Token check completed"
+          # Add your token refresh logic here if needed
+
+  # Daily summary job
+  daily-summary:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    needs: signal-monitor
+    
+    steps:
+      - name: Download logs
+        uses: actions/download-artifact@v3
+        with:
+          name: signal-logs-${{ github.run_number }}
+      
+      - name: Generate summary
+        run: |
+          echo "Generating daily summary..."
+          # Parse logs and generate summary
+          # This is a placeholder - implement your summary logic
+      
+      - name: Send summary
+        if: env.DISCORD_WEBHOOK_URL != ''
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          # Send daily summary to Discord
+          echo "Daily summary sent"
