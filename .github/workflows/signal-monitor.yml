@@ -125,7 +125,7 @@ jobs:
         
         # Run the signal monitor
         # The script handles its own timing and will exit at 4 PM IST
-        python nifty_signal_system.py
+        python nifty_signals.py
         
         # Capture exit code
         EXIT_CODE=$?
