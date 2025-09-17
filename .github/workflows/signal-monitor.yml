@@ -1,134 +1,293 @@
-name: NIFTY Signal Monitor
+name: NIFTY Continuous Monitor
 
 on:
-  schedule:
-    # Start at 9:10 AM IST (3:40 AM UTC)
-    - cron: '40 3 * * 1-5'
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - develop
-
-env:
-  TZ: 'Asia/Kolkata'
-  PYTHONUNBUFFERED: '1'
+    inputs:
+      force_run:
+        description: 'Force run outside market hours'
+        required: false
+        default: 'false'
+  
+  # Start at 9:00 AM IST (3:30 AM UTC) on weekdays
+  schedule:
+    - cron: '30 3 * * 1-5'
 
 jobs:
-  signal-monitor:
+  continuous-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 420  # 7 hours
+    timeout-minutes: 450  # 7.5 hours to cover full market day
+    
+    env:
+      TZ: Asia/Kolkata
+      PYTHONUNBUFFERED: 1  # Ensure real-time output
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      
-      - name: Create logs directory
-        run: mkdir -p logs
-      
-      - name: Check market hours
-        id: market_check
-        run: |
-          python - <<'EOF'
-          from datetime import datetime
-          import pytz, os
-          
-          ist = pytz.timezone('Asia/Kolkata')
-          now = datetime.now(ist)
-          is_weekday = now.weekday() < 5
-          is_market_hours = (9, 15) <= (now.hour, now.minute) <= (16, 0)
-          
-          should_run = is_weekday and is_market_hours
-          print(f"Market {'OPEN' if should_run else 'CLOSED'} (Day: {now.strftime('%A')}, Time: {now.strftime('%H:%M')} IST)")
-          
-          # Use the new way to pass outputs
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"should_run={str(should_run).lower()}\n")
-          EOF
-      
-      - name: Run signal monitor
-        if: steps.market_check.outputs.should_run == 'true' || github.event_name == 'workflow_dispatch'
-        env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
-          LOG_LEVEL: 'INFO'
-          LOG_TO_FILE: 'true'
-          COLORFUL_LOGS: 'false'  # Disable colors in CI
-          UPDATE_FREQUENCY: '1.0'  # Less frequent updates in CI
-        run: |
-          echo "Starting NIFTY Signal Monitor..."
-          echo "Current time: $(date)"
-          
-          # Run with timeout (6.5 hours)
-          timeout 23400 python nifty_signals.py || EXIT_CODE=$?
-          
-          if [ "$EXIT_CODE" = "124" ]; then
-            echo "Monitor stopped after market hours (timeout)"
-            exit 0
-          else
-            exit $EXIT_CODE
-          fi
-      
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: signal-logs-${{ github.run_number }}
-          path: logs/
-          retention-days: 7
-      
-      - name: Send notification
-        if: failure()
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          if [ ! -z "$DISCORD_WEBHOOK_URL" ]; then
-            curl -H "Content-Type: application/json" \
-                 -d '{"content":"⚠️ NIFTY Signal Monitor failed! Check GitHub Actions logs."}' \
-                 $DISCORD_WEBHOOK_URL
-
-  token-refresh:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
-    steps:
-      - name: Check token expiry
-        env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-        run: |
-          echo "Token check completed"
-          # Add token refresh logic here
-
-  daily-summary:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
-    needs: signal-monitor
+    - name: Checkout code
+      uses: actions/checkout@v3
     
-    steps:
-      - name: Download logs
-        uses: actions/download-artifact@v4
-        with:
-          name: signal-logs-${{ github.run_number }}
-      
-      - name: Generate summary
-        run: |
-          echo "Generating daily summary..."
-          # Parse logs and generate summary
-      
-      - name: Send summary
-        if: env.DISCORD_WEBHOOK_URL != ''
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          echo "Daily summary sent"
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/pip
+          ~/.local
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Pre-flight check
+      run: |
+        echo "🔍 Pre-flight Check"
+        echo "=================="
+        echo "Current time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo "Python version: $(python --version)"
+        echo "Working directory: $(pwd)"
+        echo ""
+        
+        # Check if we're in market hours
+        python3 << 'EOF'
+        from datetime import datetime
+        import pytz
+        
+        ist = pytz.timezone('Asia/Kolkata')
+        now = datetime.now(ist)
+        
+        print(f"IST Time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
+        print(f"Day: {now.strftime('%A')}")
+        
+        market_open = now.replace(hour=9, minute=15, second=0)
+        market_close = now.replace(hour=16, minute=0, second=0)
+        
+        if now.weekday() < 5:  # Monday = 0, Friday = 4
+            if market_open <= now <= market_close:
+                print("✅ Market is OPEN")
+            elif now < market_open:
+                wait_time = (market_open - now).total_seconds() / 60
+                print(f"⏳ Market opens in {wait_time:.0f} minutes")
+            else:
+                print("🌙 Market is CLOSED for today")
+        else:
+            print("🏖️ Weekend - Market is closed")
+        EOF
+    
+    - name: Create .env file
+      env:
+        UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        FORCE_RUN_INPUT: ${{ github.event.inputs.force_run }}
+      run: |
+        # Determine FORCE_RUN setting
+        if [ "$FORCE_RUN_INPUT" = "true" ]; then
+          FORCE_RUN="true"
+        else
+          FORCE_RUN="${{ vars.FORCE_RUN || 'false' }}"
+        fi
+        
+        cat > .env << EOF
+        # API Configuration
+        UPSTOX_ACCESS_TOKEN=$UPSTOX_ACCESS_TOKEN
+        DISCORD_WEBHOOK_URL=$DISCORD_WEBHOOK_URL
+        
+        # Runtime Configuration
+        FORCE_RUN=$FORCE_RUN
+        LOG_LEVEL=${{ vars.LOG_LEVEL || 'INFO' }}
+        LOG_TO_FILE=true
+        COLORFUL_LOGS=false
+        CLEAR_SCREEN=false
+        
+        # Trading Parameters
+        MIN_SIGNAL_STRENGTH=${{ vars.MIN_SIGNAL_STRENGTH || '65' }}
+        SIGNAL_COOLDOWN=${{ vars.SIGNAL_COOLDOWN || '300' }}
+        MIN_TICK_WARMUP=${{ vars.MIN_TICK_WARMUP || '100' }}
+        MAX_SIGNALS_PER_DAY=${{ vars.MAX_SIGNALS_PER_DAY || '10' }}
+        
+        # Technical Indicators
+        RSI_PERIOD=${{ vars.RSI_PERIOD || '14' }}
+        VWAP_SENSITIVITY=${{ vars.VWAP_SENSITIVITY || '0.001' }}
+        VOLATILITY_WINDOW=${{ vars.VOLATILITY_WINDOW || '20' }}
+        SUPERTREND_PERIOD=${{ vars.SUPERTREND_PERIOD || '10' }}
+        SUPERTREND_MULTIPLIER=${{ vars.SUPERTREND_MULTIPLIER || '3.0' }}
+        
+        # Risk Parameters
+        MAX_VOLATILITY=${{ vars.MAX_VOLATILITY || '0.35' }}
+        MIN_LIQUIDITY_SCORE=${{ vars.MIN_LIQUIDITY_SCORE || '60' }}
+        
+        # Market Hours
+        MARKET_OPEN_HOUR=${{ vars.MARKET_OPEN_HOUR || '9' }}
+        MARKET_OPEN_MINUTE=${{ vars.MARKET_OPEN_MINUTE || '15' }}
+        MARKET_CLOSE_HOUR=${{ vars.MARKET_CLOSE_HOUR || '16' }}
+        MARKET_CLOSE_MINUTE=${{ vars.MARKET_CLOSE_MINUTE || '0' }}
+        
+        # Display Settings
+        UPDATE_FREQUENCY=${{ vars.UPDATE_FREQUENCY || '0.5' }}
+        SHOW_INDICATORS=${{ vars.SHOW_INDICATORS || 'true' }}
+        
+        # Alert Settings
+        SOUND_ALERTS=false
+        DESKTOP_NOTIFICATIONS=false
+        
+        # Debug Settings
+        DEBUG_MODE=${{ vars.DEBUG_MODE || 'false' }}
+        SAVE_TICK_DATA=${{ vars.SAVE_TICK_DATA || 'false' }}
+        EOF
+        
+        echo "✅ Environment file created"
+    
+    - name: Start monitoring with health checks
+      run: |
+        # Create a monitoring wrapper script
+        cat > monitor_wrapper.sh << 'EOF'
+        #!/bin/bash
+        
+        echo "🚀 Starting NIFTY Signal Monitor Wrapper"
+        echo "======================================="
+        
+        # Function to send Discord notification
+        send_discord_notification() {
+            local title="$1"
+            local message="$2"
+            local color="$3"
+            
+            if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+                curl -s -X POST "$DISCORD_WEBHOOK_URL" \
+                    -H "Content-Type: application/json" \
+                    -d "{
+                        \"embeds\": [{
+                            \"title\": \"$title\",
+                            \"description\": \"$message\",
+                            \"color\": $color,
+                            \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
+                        }]
+                    }"
+            fi
+        }
+        
+        # Send startup notification
+        send_discord_notification \
+            "🟢 Signal Monitor Started" \
+            "GitHub Actions workflow started at $(date '+%H:%M:%S IST')" \
+            "65280"
+        
+        # Run the Python script
+        echo "Starting main signal monitor..."
+        echo ""
+        
+        python3 nifty_signal_system.py
+        EXIT_CODE=$?
+        
+        echo ""
+        echo "======================================="
+        
+        if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Signal monitor completed successfully"
+            send_discord_notification \
+                "🔵 Signal Monitor Completed" \
+                "Market session ended at $(date '+%H:%M:%S IST')" \
+                "3447003"
+        else
+            echo "❌ Signal monitor exited with code: $EXIT_CODE"
+            send_discord_notification \
+                "🔴 Signal Monitor Error" \
+                "Monitor exited with code $EXIT_CODE at $(date '+%H:%M:%S IST')" \
+                "15158332"
+        fi
+        
+        exit $EXIT_CODE
+        EOF
+        
+        chmod +x monitor_wrapper.sh
+        
+        # Export Discord webhook for the wrapper
+        export DISCORD_WEBHOOK_URL="${{ secrets.DISCORD_WEBHOOK_URL }}"
+        
+        # Run the wrapper
+        ./monitor_wrapper.sh
+    
+    - name: Generate summary report
+      if: always()
+      run: |
+        echo "📊 Session Summary"
+        echo "=================="
+        
+        # Check if logs directory exists
+        if [ -d "logs" ]; then
+            echo "📁 Log files:"
+            ls -la logs/
+            
+            # Extract summary from logs
+            if [ -f logs/*.log ]; then
+                echo ""
+                echo "📈 Signal Summary:"
+                grep -i "signal.*detected\|signal.*alert" logs/*.log | tail -10 || echo "No signals found"
+                
+                echo ""
+                echo "⚠️  Errors/Warnings:"
+                grep -i "error\|warning" logs/*.log | tail -5 || echo "No errors found"
+            fi
+        else
+            echo "No log directory found"
+        fi
+        
+        echo ""
+        echo "⏱️  End time: $(date '+%Y-%m-%d %H:%M:%S IST')"
+    
+    - name: Upload logs and data
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: monitor-session-${{ github.run_number }}
+        path: |
+          logs/
+          *.csv
+          *.json
+        retention-days: 30
+        if-no-files-found: ignore
+    
+    - name: Create performance metrics
+      if: always()
+      run: |
+        # Create a simple metrics file
+        cat > metrics.json << EOF
+        {
+          "run_number": "${{ github.run_number }}",
+          "start_time": "${{ github.event.repository.updated_at }}",
+          "end_time": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
+          "status": "${{ job.status }}",
+          "force_run": "${{ github.event.inputs.force_run || 'false' }}"
+        }
+        EOF
+    
+    - name: Final notification
+      if: always()
+      env:
+        DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      run: |
+        if [ -n "$DISCORD_WEBHOOK_URL" ] && [ "${{ job.status }}" = "failure" ]; then
+          curl -s -X POST $DISCORD_WEBHOOK_URL \
+            -H "Content-Type: application/json" \
+            -d '{
+              "content": "@here",
+              "embeds": [{
+                "title": "⚠️ NIFTY Monitor Workflow Failed",
+                "color": 16711680,
+                "fields": [
+                  {"name": "Status", "value": "'"${{ job.status }}"'", "inline": true},
+                  {"name": "Run", "value": "#'"${{ github.run_number }}"'", "inline": true},
+                  {"name": "Time", "value": "'"$(date '+%H:%M IST')"'", "inline": true}
+                ],
+                "footer": {
+                  "text": "Check GitHub Actions for details"
+                }
+              }]
+            }'
+        fi
