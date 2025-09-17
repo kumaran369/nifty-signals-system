@@ -192,26 +192,32 @@ jobs:
             STATUS_MSG="completed with warnings"
           fi
           
-          curl -X POST $DISCORD_WEBHOOK_URL \
+          # Create JSON payload
+          PAYLOAD=$(cat <<EOF
+        {
+          "content": "$STATUS_EMOJI NIFTY Signal Monitor $STATUS_MSG",
+          "embeds": [{
+            "title": "Workflow Summary",
+            "color": $COLOR,
+            "fields": [
+              {"name": "Status", "value": "${{ job.status }}", "inline": true},
+              {"name": "Run Number", "value": "${{ github.run_number }}", "inline": true},
+              {"name": "Repository", "value": "${{ github.repository }}", "inline": true},
+              {"name": "Triggered By", "value": "${{ github.event_name }}", "inline": true}
+            ],
+            "footer": {
+              "text": "View logs in GitHub Actions"
+            },
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+          }]
+        }
+        EOF
+        )
+          
+          # Send notification
+          curl -X POST "$DISCORD_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
-            -d '{
-              "content": "'$STATUS_EMOJI' NIFTY Signal Monitor '$STATUS_MSG'",
-              "embeds": [{
-                "title": "Workflow Summary",
-                "color": '$COLOR',
-                "fields": [
-                  {"name": "Status", "value": "'${{ job.status }}'", "inline": true},
-                  {"name": "Run Number", "value": "'${{ github.run_number }}'", "inline": true},
-                  {"name": "Repository", "value": "'${{ github.repository }}'", "inline": true},
-                  {"name": "Duration", "value": "'${{ steps.monitor.outcome }}'", "inline": true},
-                  {"name": "Triggered By", "value": "'${{ github.event_name }}'", "inline": true}
-                ],
-                "footer": {
-                  "text": "View logs in GitHub Actions"
-                },
-                "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'"
-              }]
-            }'
+            -d "$PAYLOAD"
         fi
     
     - name: Create summary
