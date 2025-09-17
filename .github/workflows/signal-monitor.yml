@@ -1,41 +1,44 @@
-name: NIFTY Continuous Monitor
+name: NIFTY Signal Monitor
 
 on:
+  # Manual trigger
   workflow_dispatch:
     inputs:
       force_run:
-        description: 'Force run outside market hours'
+        description: 'Run outside market hours'
+        type: boolean
         required: false
-        default: 'false'
+        default: false
   
-  # Start at 9:00 AM IST (3:30 AM UTC) on weekdays
+  # Schedule to start at market open (9:00 AM IST = 3:30 AM UTC)
   schedule:
-    - cron: '30 3 * * 1-5'
+    - cron: '30 3 * * 1-5'  # Monday to Friday at 9:00 AM IST
 
 jobs:
-  continuous-monitor:
+  signal-monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 450  # 7.5 hours to cover full market day
+    timeout-minutes: 420  # 7 hours (9 AM to 4 PM)
     
+    # Continue on error to ensure logs are uploaded
+    continue-on-error: true
+    
+    # Set timezone to IST
     env:
       TZ: Asia/Kolkata
-      PYTHONUNBUFFERED: 1  # Ensure real-time output
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.9'
     
-    - name: Cache dependencies
-      uses: actions/cache@v3
+    - name: Cache pip dependencies
+      uses: actions/cache@v4
       with:
-        path: |
-          ~/.cache/pip
-          ~/.local
+        path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
@@ -45,61 +48,28 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Pre-flight check
+    - name: Validate secrets
       run: |
-        echo "🔍 Pre-flight Check"
-        echo "=================="
-        echo "Current time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-        echo "Python version: $(python --version)"
-        echo "Working directory: $(pwd)"
-        echo ""
-        
-        # Check if we're in market hours
-        python3 << 'EOF'
-        from datetime import datetime
-        import pytz
-        
-        ist = pytz.timezone('Asia/Kolkata')
-        now = datetime.now(ist)
-        
-        print(f"IST Time: {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
-        print(f"Day: {now.strftime('%A')}")
-        
-        market_open = now.replace(hour=9, minute=15, second=0)
-        market_close = now.replace(hour=16, minute=0, second=0)
-        
-        if now.weekday() < 5:  # Monday = 0, Friday = 4
-            if market_open <= now <= market_close:
-                print("✅ Market is OPEN")
-            elif now < market_open:
-                wait_time = (market_open - now).total_seconds() / 60
-                print(f"⏳ Market opens in {wait_time:.0f} minutes")
-            else:
-                print("🌙 Market is CLOSED for today")
-        else:
-            print("🏖️ Weekend - Market is closed")
-        EOF
+        if [ -z "${{ secrets.UPSTOX_ACCESS_TOKEN }}" ]; then
+          echo "❌ Error: UPSTOX_ACCESS_TOKEN secret is not set!"
+          echo "Please add it in: Settings → Secrets and variables → Actions"
+          exit 1
+        fi
+        echo "✅ UPSTOX_ACCESS_TOKEN is configured"
     
-    - name: Create .env file
+    - name: Create .env file from secrets
       env:
         UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        FORCE_RUN_INPUT: ${{ github.event.inputs.force_run }}
       run: |
-        # Determine FORCE_RUN setting
-        if [ "$FORCE_RUN_INPUT" = "true" ]; then
-          FORCE_RUN="true"
-        else
-          FORCE_RUN="${{ vars.FORCE_RUN || 'false' }}"
-        fi
-        
+        # Create .env file with secrets and configuration
         cat > .env << EOF
         # API Configuration
         UPSTOX_ACCESS_TOKEN=$UPSTOX_ACCESS_TOKEN
         DISCORD_WEBHOOK_URL=$DISCORD_WEBHOOK_URL
         
-        # Runtime Configuration
-        FORCE_RUN=$FORCE_RUN
+        # GitHub Actions specific settings
+        FORCE_RUN=${{ github.event.inputs.force_run || vars.FORCE_RUN || 'false' }}
         LOG_LEVEL=${{ vars.LOG_LEVEL || 'INFO' }}
         LOG_TO_FILE=true
         COLORFUL_LOGS=false
@@ -140,154 +110,127 @@ jobs:
         DEBUG_MODE=${{ vars.DEBUG_MODE || 'false' }}
         SAVE_TICK_DATA=${{ vars.SAVE_TICK_DATA || 'false' }}
         EOF
-        
-        echo "✅ Environment file created"
     
-    - name: Start monitoring with health checks
+    - name: Create logs directory
+      run: mkdir -p logs
+    
+    - name: Run NIFTY Signal Monitor
+      id: monitor
       run: |
-        # Create a monitoring wrapper script
-        cat > monitor_wrapper.sh << 'EOF'
-        #!/bin/bash
-        
-        echo "🚀 Starting NIFTY Signal Monitor Wrapper"
-        echo "======================================="
-        
-        # Function to send Discord notification
-        send_discord_notification() {
-            local title="$1"
-            local message="$2"
-            local color="$3"
-            
-            if [ -n "$DISCORD_WEBHOOK_URL" ]; then
-                curl -s -X POST "$DISCORD_WEBHOOK_URL" \
-                    -H "Content-Type: application/json" \
-                    -d "{
-                        \"embeds\": [{
-                            \"title\": \"$title\",
-                            \"description\": \"$message\",
-                            \"color\": $color,
-                            \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"
-                        }]
-                    }"
-            fi
-        }
-        
-        # Send startup notification
-        send_discord_notification \
-            "🟢 Signal Monitor Started" \
-            "GitHub Actions workflow started at $(date '+%H:%M:%S IST')" \
-            "65280"
-        
-        # Run the Python script
-        echo "Starting main signal monitor..."
+        echo "🚀 Starting NIFTY Signal Monitor"
+        echo "⏰ Current time: $(date)"
+        echo "📊 Market hours: 9:15 AM - 4:00 PM IST"
+        echo "⚡ The script will run continuously until market close"
         echo ""
         
-        python3 nifty_signal_system.py
+        # Run the signal monitor
+        # The script handles its own timing and will exit at 4 PM IST
+        python nifty_signal_system.py
+        
+        # Capture exit code
         EXIT_CODE=$?
         
         echo ""
-        echo "======================================="
+        echo "✅ Market session ended with exit code: $EXIT_CODE"
         
-        if [ $EXIT_CODE -eq 0 ]; then
-            echo "✅ Signal monitor completed successfully"
-            send_discord_notification \
-                "🔵 Signal Monitor Completed" \
-                "Market session ended at $(date '+%H:%M:%S IST')" \
-                "3447003"
-        else
-            echo "❌ Signal monitor exited with code: $EXIT_CODE"
-            send_discord_notification \
-                "🔴 Signal Monitor Error" \
-                "Monitor exited with code $EXIT_CODE at $(date '+%H:%M:%S IST')" \
-                "15158332"
+        # Check if any signals were generated
+        if [ -d "logs" ] && [ -n "$(ls -A logs 2>/dev/null)" ]; then
+          echo "📊 Log files generated"
         fi
         
         exit $EXIT_CODE
-        EOF
-        
-        chmod +x monitor_wrapper.sh
-        
-        # Export Discord webhook for the wrapper
-        export DISCORD_WEBHOOK_URL="${{ secrets.DISCORD_WEBHOOK_URL }}"
-        
-        # Run the wrapper
-        ./monitor_wrapper.sh
     
-    - name: Generate summary report
+    - name: Check for signals
       if: always()
       run: |
-        echo "📊 Session Summary"
-        echo "=================="
-        
-        # Check if logs directory exists
+        # Look for signal alerts in logs
         if [ -d "logs" ]; then
-            echo "📁 Log files:"
-            ls -la logs/
-            
-            # Extract summary from logs
-            if [ -f logs/*.log ]; then
-                echo ""
-                echo "📈 Signal Summary:"
-                grep -i "signal.*detected\|signal.*alert" logs/*.log | tail -10 || echo "No signals found"
-                
-                echo ""
-                echo "⚠️  Errors/Warnings:"
-                grep -i "error\|warning" logs/*.log | tail -5 || echo "No errors found"
-            fi
-        else
-            echo "No log directory found"
+          echo "📋 Checking for signals in log files..."
+          grep -h "SIGNAL" logs/*.log 2>/dev/null || echo "No signals found in logs"
         fi
-        
-        echo ""
-        echo "⏱️  End time: $(date '+%Y-%m-%d %H:%M:%S IST')"
     
-    - name: Upload logs and data
+    - name: Upload logs
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: monitor-session-${{ github.run_number }}
+        name: signal-logs-${{ github.run_number }}-${{ github.run_attempt }}
         path: |
           logs/
+          *.log
+        if-no-files-found: warn
+        retention-days: 7
+    
+    - name: Upload tick data
+      if: always() && vars.SAVE_TICK_DATA == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: tick-data-${{ github.run_number }}-${{ github.run_attempt }}
+        path: |
+          tick_data/
           *.csv
-          *.json
-        retention-days: 30
         if-no-files-found: ignore
+        retention-days: 3
     
-    - name: Create performance metrics
-      if: always()
-      run: |
-        # Create a simple metrics file
-        cat > metrics.json << EOF
-        {
-          "run_number": "${{ github.run_number }}",
-          "start_time": "${{ github.event.repository.updated_at }}",
-          "end_time": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
-          "status": "${{ job.status }}",
-          "force_run": "${{ github.event.inputs.force_run || 'false' }}"
-        }
-        EOF
-    
-    - name: Final notification
+    - name: Send completion notification
       if: always()
       env:
         DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
       run: |
-        if [ -n "$DISCORD_WEBHOOK_URL" ] && [ "${{ job.status }}" = "failure" ]; then
-          curl -s -X POST $DISCORD_WEBHOOK_URL \
+        if [ -n "$DISCORD_WEBHOOK_URL" ]; then
+          # Determine status and color
+          if [ "${{ job.status }}" == "success" ]; then
+            STATUS_EMOJI="✅"
+            COLOR=3066993
+            STATUS_MSG="completed successfully"
+          elif [ "${{ job.status }}" == "failure" ]; then
+            STATUS_EMOJI="❌"
+            COLOR=15158332
+            STATUS_MSG="failed"
+          else
+            STATUS_EMOJI="⚠️"
+            COLOR=16776960
+            STATUS_MSG="completed with warnings"
+          fi
+          
+          curl -X POST $DISCORD_WEBHOOK_URL \
             -H "Content-Type: application/json" \
             -d '{
-              "content": "@here",
+              "content": "'$STATUS_EMOJI' NIFTY Signal Monitor '$STATUS_MSG'",
               "embeds": [{
-                "title": "⚠️ NIFTY Monitor Workflow Failed",
-                "color": 16711680,
+                "title": "Workflow Summary",
+                "color": '$COLOR',
                 "fields": [
-                  {"name": "Status", "value": "'"${{ job.status }}"'", "inline": true},
-                  {"name": "Run", "value": "#'"${{ github.run_number }}"'", "inline": true},
-                  {"name": "Time", "value": "'"$(date '+%H:%M IST')"'", "inline": true}
+                  {"name": "Status", "value": "'${{ job.status }}'", "inline": true},
+                  {"name": "Run Number", "value": "'${{ github.run_number }}'", "inline": true},
+                  {"name": "Repository", "value": "'${{ github.repository }}'", "inline": true},
+                  {"name": "Duration", "value": "'${{ steps.monitor.outcome }}'", "inline": true},
+                  {"name": "Triggered By", "value": "'${{ github.event_name }}'", "inline": true}
                 ],
                 "footer": {
-                  "text": "Check GitHub Actions for details"
-                }
+                  "text": "View logs in GitHub Actions"
+                },
+                "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'"
               }]
             }'
+        fi
+    
+    - name: Create summary
+      if: always()
+      run: |
+        # Create job summary
+        echo "## 📊 NIFTY Signal Monitor Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Start Time**: $(date)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Run Number**: ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Triggered By**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ -d "logs" ] && [ -n "$(ls -A logs 2>/dev/null)" ]; then
+          echo "### 📋 Signals Generated" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          grep -h "SIGNAL\|Signal" logs/*.log 2>/dev/null | head -20 || echo "No signals found"
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "### 📋 No log files generated" >> $GITHUB_STEP_SUMMARY
         fi
